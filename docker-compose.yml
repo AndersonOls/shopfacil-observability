@@ -1,0 +1,230 @@
+x-app: &app
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: shopfacil/app:local
+  restart: unless-stopped
+  environment: &app-env
+    DEPLOYMENT_ENVIRONMENT: docker
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-collector:4318/v1/traces
+    LOG_LEVEL: info
+  depends_on:
+    otel-collector:
+      condition: service_started
+
+services:
+  gateway:
+    <<: *app
+    command: node gateway/src/server.js
+    environment:
+      <<: *app-env
+      PORT: '3000'
+      OTEL_SERVICE_NAME: gateway
+      JWT_SECRET: dev-secret-change-me
+      CATALOG_URL: http://catalog:3001
+      INVENTORY_URL: http://inventory:3002
+      PAYMENT_URL: http://payment:3003
+      ORDERS_URL: http://orders:3004
+    ports:
+      - '3000:3000'
+    depends_on:
+      otel-collector:
+        condition: service_started
+      catalog:
+        condition: service_started
+      inventory:
+        condition: service_started
+      payment:
+        condition: service_started
+      orders:
+        condition: service_started
+
+  catalog:
+    <<: *app
+    command: node services/catalog/src/server.js
+    environment:
+      <<: *app-env
+      PORT: '3001'
+      OTEL_SERVICE_NAME: catalog
+    ports:
+      - '3001:3001'
+
+  inventory:
+    <<: *app
+    command: node services/inventory/src/server.js
+    environment:
+      <<: *app-env
+      PORT: '3002'
+      OTEL_SERVICE_NAME: inventory
+    ports:
+      - '3002:3002'
+
+  payment:
+    <<: *app
+    command: node services/payment/src/server.js
+    environment:
+      <<: *app-env
+      PORT: '3003'
+      OTEL_SERVICE_NAME: payment
+      EXTERNAL_GATEWAY_PORT: '4090'
+      EXTERNAL_GATEWAY_URL: http://127.0.0.1:4090
+      EXTERNAL_GATEWAY_LATENCY_MS: '50'
+      EXTERNAL_GATEWAY_FAILURE_RATE: '0'
+    ports:
+      - '3003:3003'
+
+  orders:
+    <<: *app
+    command: node services/orders/src/server.js
+    environment:
+      <<: *app-env
+      PORT: '3004'
+      OTEL_SERVICE_NAME: orders
+      INVENTORY_URL: http://inventory:3002
+      PAYMENT_URL: http://payment:3003
+    ports:
+      - '3004:3004'
+    depends_on:
+      otel-collector:
+        condition: service_started
+      inventory:
+        condition: service_started
+      payment:
+        condition: service_started
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.111.0
+    command: ['--config=/etc/otelcol/config.yaml']
+    volumes:
+      - ./infra/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - '4317:4317'
+      - '4318:4318'
+      - '8888:8888'
+    depends_on:
+      tempo:
+        condition: service_started
+    restart: unless-stopped
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    command: ['-config.file=/etc/tempo.yaml']
+    volumes:
+      - ./infra/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - '3200:3200'
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.2.1
+    command: ['-config.file=/etc/loki/local-config.yaml']
+    volumes:
+      - ./infra/loki-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+    ports:
+      - '3100:3100'
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:3.2.1
+    command: ['-config.file=/etc/promtail/config.yaml']
+    volumes:
+      - ./infra/promtail-config.yaml:/etc/promtail/config.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    depends_on:
+      loki:
+        condition: service_started
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/recording-rules.yml:/etc/prometheus/recording-rules.yml:ro
+      - ./infra/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - '9090:9090'
+    depends_on:
+      alertmanager:
+        condition: service_started
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    volumes:
+      - ./infra/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      - '9093:9093'
+    depends_on:
+      webhook:
+        condition: service_started
+    restart: unless-stopped
+
+  webhook:
+    image: node:22-bookworm-slim
+    working_dir: /app
+    command: ['node', 'server.js']
+    environment:
+      WEBHOOK_PORT: '5001'
+    volumes:
+      - ./infra/webhook:/app:ro
+    ports:
+      - '5001:5001'
+    restart: unless-stopped
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    command: ['--path.rootfs=/host']
+    volumes:
+      - /:/host:ro,rslave
+    ports:
+      - '9100:9100'
+    restart: unless-stopped
+
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.25.0
+    command: ['--config.file=/etc/blackbox/blackbox.yml']
+    volumes:
+      - ./infra/blackbox.yml:/etc/blackbox/blackbox.yml:ro
+    ports:
+      - '9115:9115'
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - '3005:3000'
+    depends_on:
+      prometheus:
+        condition: service_started
+      loki:
+        condition: service_started
+      tempo:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  grafana-data:
+  loki-data:
+  tempo-data:
+  alertmanager-data:

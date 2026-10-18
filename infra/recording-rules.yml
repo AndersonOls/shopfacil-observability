@@ -1,0 +1,22 @@
+groups:
+  - name: shopfacil-availability
+    interval: 30s
+    rules:
+      - record: shopfacil:up:ratio
+        expr: avg(up{job="services"})
+      - record: shopfacil:probe:ratio
+        expr: avg(probe_success)
+      - record: shopfacil:availability:ratio
+        expr: (avg(up{job="services"}) + avg(probe_success)) / 2
+
+  - name: shopfacil-mttr
+    interval: 30s
+    rules:
+      # Current age of every active (pending/firing) alert, in seconds.
+      - record: shopfacil:alert_active_seconds
+        expr: time() - ALERTS_FOR_STATE
+      # Approximate MTTR: mean age of unresolved alerts.
+      # This is an approximation derived from the alert lifecycle, documented in
+      # docs/architecture.md; it has no series when no alert is active.
+      - record: shopfacil:mttr_seconds
+        expr: avg(shopfacil:alert_active_seconds)

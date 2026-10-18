@@ -1,0 +1,29 @@
+{
+  "name": "shopfacil-observability",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ShopFacil + stack de observabilidade (OTel, Prometheus, Grafana, Loki, Tempo, Alertmanager)",
+  "workspaces": [
+    "packages/*",
+    "services/*",
+    "gateway"
+  ],
+  "scripts": {
+    "test": "node --test packages/*/test/*.test.js services/*/test/*.test.js gateway/test/*.test.js",
+    "test:integration": "node --test test/integration/*.test.js",
+    "smoke:telemetry": "node packages/telemetry/scripts/smoke.js",
+    "start:catalog": "node services/catalog/src/server.js",
+    "start:inventory": "node services/inventory/src/server.js",
+    "start:payment": "node services/payment/src/server.js",
+    "start:orders": "node services/orders/src/server.js",
+    "start:gateway": "node gateway/src/server.js",
+    "docs:pdf": "bash scripts/export-pdf.sh"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "allowScripts": {
+    "better-sqlite3@11.10.0": true,
+    "protobufjs@7.6.6": true
+  }
+}

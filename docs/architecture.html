@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>ShopFacil — Arquitetura e Observabilidade</title>
+<style>
+@page { size: A4; margin: 2cm 1.8cm; }
+html { font-family: "Liberation Sans", Arial, sans-serif; }
+body { color: #1a1a1a; font-size: 10.5pt; line-height: 1.45; }
+h1 { font-size: 20pt; border-bottom: 2px solid #333; padding-bottom: 4px; margin-top: 0; }
+h2 { font-size: 14pt; margin-top: 18px; border-bottom: 1px solid #bbb; padding-bottom: 2px; page-break-after: avoid; }
+h3 { font-size: 12pt; margin-top: 12px; page-break-after: avoid; }
+p { margin: 6px 0; text-align: justify; }
+pre { background: #f4f4f4; border: 1px solid #ddd; padding: 8px; font-family: "Liberation Mono", monospace; font-size: 8.5pt; white-space: pre-wrap; page-break-inside: avoid; }
+code { background: #f0f0f0; padding: 0 2px; font-family: "Liberation Mono", monospace; font-size: 9pt; }
+table { border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 9pt; page-break-inside: avoid; }
+th, td { border: 1px solid #ccc; padding: 4px 6px; text-align: left; vertical-align: top; }
+th { background: #eee; }
+blockquote { border-left: 3px solid #999; margin: 8px 0; padding: 4px 10px; color: #444; }
+hr { border: none; border-top: 1px solid #ccc; margin: 12px 0; }
+ul, ol { margin: 6px 0; padding-left: 22px; }
+</style>
+</head>
+<body>
+<h1>ShopFacil — Arquitetura e Estratégia de Observabilidade</h1>
+<h2>1. Introdução</h2>
+<p>O ShopFacil é um sistema de demonstração de e-commerce composto por cinco serviços Node.js (gateway, catálogo, pedidos, estoque e pagamento) que juntos executam um fluxo de checkout distribuído. Este documento descreve a arquitetura do sistema e a estratégia de observabilidade adotada em três pilares — métricas, logs e traces — incluindo a política de amostragem, o catálogo de alertas e os dashboards.</p>
+<p>O objetivo não é construir um sistema pronto para produção, mas um ambiente genuíno o suficiente para responder a cinco perguntas operacionais:</p>
+<ol><li>O sistema está saudável?</li><li>Onde ocorreu a falha?</li><li>O que está lento?</li><li>Qual é a causa raiz?</li><li>Como evitar a recorrência?</li></ol>
+<p>O sistema roda inteiramente em uma única máquina com Docker Compose, sem Kubernetes e sem serviços de nuvem. Essa restrição mantém o custo baixo e torna o ambiente reprodutível.</p>
+<h2>2. Visão de arquitetura</h2>
+<p>O tráfego chega ao <strong>API Gateway</strong>, que autentica o usuário, emite um JWT e roteia as chamadas para os serviços internos, propagando o contexto de trace W3C (<code>traceparent</code>) em cada salto.</p>
+<pre>                         +-------------------+
+                         |      Cliente      |
+                         +---------+---------+
+                                   |  HTTP + traceparent (W3C)
+                                   v
+                 +-----------------------------------+
+                 |            API Gateway            |
+                 |  POST /auth/login (JWT)           |
+                 |  roteia /api/* + propaga contexto |
+                 +--+--------+--------+--------+-----+
+                    |        |        |        |
+            +-------v-+ +----v---+ +--v-----+ +v--------+
+            | Catálogo| |Pedidos | |Pagamento| |Estoque  |
+            | SQLite  | |orquest.| |  + sim  | | SQLite  |
+            +---------+ +---+----+ +----+----+ +---------+
+                          |  |          |
+                          |  +--&gt; Estoque (reserva/libera)
+                          |             |
+                          +--------&gt;  Gateway externo simulado</pre>
+<p>Os serviços são:</p>
+<table><tr><th>Serviço</th><th>Porta</th><th>Responsabilidade</th></tr><tr><td>gateway</td><td>3000</td><td>Autenticação JWT, roteamento <code>/api/*</code>, propagação de contexto</td></tr><tr><td>catalog</td><td>3001</td><td>Listagem e consulta de produtos (SQLite)</td></tr><tr><td>orders</td><td>3004</td><td>Orquestração do checkout, compensação em caso de falha</td></tr><tr><td>inventory</td><td>3002</td><td>Reserva e liberação de estoque (SQLite)</td></tr><tr><td>payment</td><td>3003</td><td>Cobrança e adaptador para o gateway externo simulado (4090)</td></tr></table>
+<p>O fluxo de checkout é síncrono e gera spans reais entre os serviços, em vez de trechos simulados. Isso permite que o trace comprove a passagem por cada etapa e que a compensação (liberar estoque quando o pagamento falha) apareça como spans próprios.</p>
+<h2>3. Decisões de arquitetura</h2>
+<h3>3.1 Fastify em vez de Express</h3>
+<p>O Fastify foi escolhido por oferecer logging estruturado nativo, hooks de ciclo de vida e um ecossistema de instrumentação OpenTelemetry mais direto. O Express é mais familiar, mas exigiria mais código de cola para obter o mesmo resultado.</p>
+<h3>3.2 Comportamento mínimo, porém real</h3>
+<p>Catálogo e estoque usam SQLite, de modo que o checkout produz transições de estado genuínas (estoque decrementado, reserva criada e liberada). Pedidos orquestra de forma síncrona via HTTP, gerando spans entre serviços. Esse é o menor modelo que ainda exercita compensação.</p>
+<h3>3.3 Autenticação no gateway</h3>
+<p><code>POST /auth/login</code> valida credenciais contra um pequeno conjunto semeado e emite um JWT HS256. Um <code>preHandler</code> verifica o token nas rotas protegidas. Não há serviço de autenticação dedicado: a topologia permanece com cinco serviços e o evento de login ocorre dentro de um salto já rastreado.</p>
+<h3>3.4 SDK OTel em cada serviço, Collector como pipeline</h3>
+<p>Cada serviço usa o SDK OpenTelemetry e exporta OTLP para um Collector. O Collector — e não cada serviço — controla a política de amostragem e de exportação. Assim, mudanças de política não exigem redeploy dos serviços e todos os sinais convergem para uma única configuração.</p>
+<h3>3.5 Tail sampling exige um Collector gateway</h3>
+<p>A política "100% dos erros e requisições acima de 1 s, 10% do restante" não pode ser obtida com head sampling no SDK, porque o SDK decide antes de conhecer o desfecho da requisição. O processador <code>tail_sampling</code> do Collector armazena traces completos e decide após o término, com as políticas:</p>
+<ol><li><code>status_code = ERROR</code> → manter 100%.</li><li><code>latency &gt; 1s</code> → manter 100%.</li><li><code>probabilistic 10%</code> → todo o restante.</li></ol>
+<p>Consequência: todos os serviços precisam rotear spans pelo Collector, e o tráfego é bufferizado em memória (ver Riscos).</p>
+<h3>3.6 Logs estruturados com correlação automática</h3>
+<p>Os serviços registram JSON via <code>pino</code>. O contexto OTel é injetado no logger, de modo que <code>trace_id</code> e <code>span_id</code> aparecem automaticamente em cada registro, sem tratamento manual por chamada. Um caminho de redação mascara <code>password</code>, <code>authorization</code>/<code>token</code> e dados de cartão antes da serialização. Os logs são enviados ao Loki.</p>
+<h2>4. Stack de observabilidade</h2>
+<table><tr><th>Componente</th><th>Papel</th></tr><tr><td>OTel Collector</td><td>Recebe OTLP, aplica tail sampling, exporta traces para o Tempo</td></tr><tr><td>Prometheus</td><td>Coleta <code>/metrics</code> dos serviços, node-exporter e blackbox; avalia regras</td></tr><tr><td>Grafana</td><td>Datasources (Prometheus/Loki/Tempo) + dashboards provisionados</td></tr><tr><td>Loki</td><td>Armazenamento de logs, consultável por serviço e por trace id</td></tr><tr><td>Tempo</td><td>Armazenamento de traces</td></tr><tr><td>Alertmanager</td><td>Roteia alertas disparados para um receiver webhook local (demo)</td></tr><tr><td>Blackbox Exporter</td><td>Sonda endpoints de serviço para disponibilidade</td></tr><tr><td>node-exporter</td><td>Métricas de CPU, memória e disco do host</td></tr></table>
+<p>Todos os componentes sobem com <code>docker compose up</code>. O acesso aos serviços e às interfaces ocorre pelas portas: gateway 3000, catálogo 3001, estoque 3002, pagamento 3003, pedidos 3004, Grafana 3005, Prometheus 9090, Alertmanager 9093, Loki 3100, Tempo 3200, Collector 4317/4318 e webhook 5001.</p>
+<h2>5. Estratégia de métricas</h2>
+<p>Cada serviço expõe um endpoint <code>/metrics</code> compatível com Prometheus. O <code>prom-client</code> adiciona métricas de processo (CPU, memória, file descriptors) e um rótulo <code>service</code> em todas as séries, permitindo agregações por serviço.</p>
+<h3>5.1 Catálogo de métricas</h3>
+<table><tr><th>#</th><th>Métrica</th><th>Tipo</th><th>Origem</th><th>Atende</th></tr><tr><td>1</td><td><code>http_server_request_duration_seconds</code></td><td>histogram</td><td>serviços</td><td>latência p95, tempo de resposta</td></tr><tr><td>2</td><td><code>http_server_requests_total{status}</code></td><td>counter</td><td>serviços</td><td>throughput, taxa 4xx/5xx</td></tr><tr><td>3</td><td><code>process_cpu_seconds_total</code> / <code>node_cpu</code></td><td>counter</td><td>serviço + node</td><td>uso de CPU</td></tr><tr><td>4</td><td><code>process_resident_memory_bytes</code> / <code>node_memory</code></td><td>gauge</td><td>serviço + node</td><td>uso de memória</td></tr><tr><td>5</td><td><code>node_filesystem_avail_bytes</code></td><td>gauge</td><td>node-exporter</td><td>uso de disco</td></tr><tr><td>6</td><td><code>up</code> / <code>probe_success</code></td><td>gauge</td><td>Prometheus + blackbox</td><td>disponibilidade</td></tr><tr><td>7</td><td><code>shopfacil:availability:ratio</code></td><td>recording</td><td>Prometheus</td><td>disponibilidade agregada</td></tr><tr><td>8</td><td><code>shopfacil:mttr_seconds</code></td><td>recording</td><td>Prometheus (ALERTS)</td><td>MTTR</td></tr><tr><td>9</td><td><code>db_active_connections</code></td><td>gauge</td><td>catálogo/estoque</td><td>conexões ativas</td></tr><tr><td>10</td><td><code>payment_outcome_total{outcome}</code></td><td>counter</td><td>pagamento</td><td>taxa de aprovação</td></tr><tr><td>11</td><td><code>checkout_duration_seconds</code></td><td>histogram</td><td>pedidos</td><td>tempo do checkout</td></tr><tr><td>12</td><td><code>external_gateway_failures_total</code></td><td>counter</td><td>pagamento</td><td>falhas do gateway externo</td></tr></table>
+<h3>5.2 Disponibilidade e MTTR</h3>
+<p>Serviços crus não conseguem emitir "disponibilidade" ou "MTTR" de forma significativa. A disponibilidade é derivada de <code>up</code> e <code>probe_success</code> (blackbox). O MTTR não pode ser calculado com uma única coleta; ele é derivado do ciclo de vida do alerta via regras de gravação sobre <code>ALERTS_FOR_STATE</code> (tempo desde o disparo). Trata-se de uma aproximação adequada para a demo e explicitada aqui.</p>
+<h2>6. Estratégia de logs</h2>
+<h3>6.1 Formato</h3>
+<p>Os registros são JSON e contêm, no mínimo: <code>timestamp</code>, <code>level</code>, <code>service</code>, <code>message</code>, <code>trace_id</code> e <code>span_id</code>. Eventos de negócio e de auditoria incluem o campo <code>event</code> (<code>login</code>, <code>http.request</code>, <code>error</code>, <code>audit</code>, <code>critical</code>) e campos de contexto como <code>http.method</code>, <code>http.route</code>, <code>http.status_code</code> e <code>user_id</code>.</p>
+<h3>6.2 Correlação</h3>
+<p>Graças à ponte entre o contexto OTel e o <code>pino</code>, o <code>trace_id</code>/<code>span_id</code> do span ativo é injetado em cada registro. Isso permite que uma consulta no Loki por <code>trace_id</code> retorne os logs de todos os serviços que participaram do mesmo trace.</p>
+<h3>6.3 Mascaramento</h3>
+<p>Valores sensíveis — <code>password</code>, <code>token</code>, <code>authorization</code> e campos de cartão (<code>card</code>, <code>cardNumber</code>, <code>cvv</code>) — são censurados com <code>[Redacted]</code> antes de serem serializados, de modo que segredos nunca apareçam em texto claro nos logs.</p>
+<h3>6.4 Envio</h3>
+<p>O Promtail descobre os containers via socket do Docker e envia os logs ao Loki. O Loki indexa por labels (incluindo <code>service</code> e <code>trace_id</code> no conteúdo), possibilitando consultas por serviço e por trace id.</p>
+<h2>7. Estratégia de traces</h2>
+<h3>7.1 Modelo de spans do checkout</h3>
+<pre>trace: 1 request
+|
++- [gateway] POST /api/checkout            (server span)
+   |
+   +- [orders] POST /checkout              (server span, filho)
+      |
+      +- [inventory] POST /inventory/reserve   (client+server span)
+      |
+      +- [payment] POST /payments              (client+server span)
+         |
+         +- [payment] POST /charge            (client span -&gt; simulado)</pre>
+<p>Cada etapa gera um span, e a propagação W3C garante que todos pertençam ao mesmo trace. As chamadas HTTP de saída usam a instrumentação <code>undici</code>, que cria spans de cliente e injeta o <code>traceparent</code>; as entradas usam a instrumentação <code>http</code>, que extrai o contexto e cria o span de servidor.</p>
+<h3>7.2 Amostragem</h3>
+<p>A política de tail sampling é aplicada no Collector, não no SDK:</p>
+<ul><li>Erros: 100% retidos.</li><li>Requisições acima de 1 segundo: 100% retidas.</li><li>Restante: aproximadamente 10%.</li></ul>
+<p>Isso garante que as investigações sempre encontrem os traces relevantes, ao mesmo tempo em que mantém o custo de armazenamento baixo em regime normal.</p>
+<h2>8. Alertas</h2>
+<p>As regras ficam versionadas em <code>infra/alerts.yml</code> e trazem condição, severidade e ação esperada.</p>
+<table><tr><th>#</th><th>Alerta</th><th>Condição</th><th>Severidade</th><th>Ação esperada</th></tr><tr><td>1</td><td>HighCpuUsage</td><td>CPU &gt; 80% por 5m</td><td>warning</td><td>Inspecionar carga e laços lentos</td></tr><tr><td>2</td><td>HighMemoryUsage</td><td>memória &gt; 90% por 5m</td><td>warning</td><td>Investigar vazamentos / reiniciar</td></tr><tr><td>3</td><td>HighLatency</td><td>p95 &gt; 500 ms por 5m</td><td>warning</td><td>Localizar o serviço lento via traces</td></tr><tr><td>4</td><td>ServiceDown</td><td><code>up</code>/probe == 0 por 1m</td><td>critical</td><td>Reiniciar / investigar</td></tr><tr><td>5</td><td>HighErrorRate</td><td>taxa 5xx &gt; 5% por 5m</td><td>critical</td><td>Inspecionar erros e traces retidos</td></tr><tr><td>6</td><td>HighDiskUsage</td><td>disco &gt; 85% por 10m</td><td>warning</td><td>Limpar volumes</td></tr><tr><td>7</td><td>PaymentFailure</td><td>falhas do gateway externo acima do limiar</td><td>critical</td><td>Verificar o gateway externo</td></tr></table>
+<p>O Alertmanager roteia todos os alertas para um receiver webhook local (<code>infra/webhook/server.js</code>), que registra as notificações (modo demo). Um receiver Slack pode ser adicionado sem alterar as regras. Quando a condição cessa, o alerta transita para <code>resolved</code> automaticamente, o que habilita o cálculo aproximado de MTTR.</p>
+<h2>9. Dashboards</h2>
+<h3>9.1 Visão Geral</h3>
+<p>O dashboard "Visão Geral" apresenta disponibilidade, CPU, memória, latência p95 por serviço, erros por minuto, requisições por segundo e os serviços mais lentos. Ele responde às perguntas "o sistema está saudável?" e "o que está lento?".</p>
+<h3>9.2 Checkout</h3>
+<p>O dashboard "Checkout" apresenta a taxa de aprovação de pagamentos, o tempo do checkout (p50/p95), o volume de resultados de pagamento e as falhas do gateway externo. Ele responde "onde ocorreu a falha?" e "qual é a causa raiz?" no fluxo de compra.</p>
+<p>Ambos são versionados como JSON em <code>infra/grafana/dashboards</code> e provisionados automaticamente pelo Grafana na inicialização, sem importação manual.</p>
+<h2>10. Operação</h2>
+<h3>10.1 Subir a stack</h3>
+<pre>docker compose up -d --build</pre>
+<h3>10.2 Gerar tráfego de checkout</h3>
+<pre>TOKEN=$(curl -s -XPOST localhost:3000/auth/login \
+  -H 'content-type: application/json' \
+  -d '{"username":"demo","password":"demo"}' | jq -r .token)
+
+curl -s -XPOST localhost:3000/api/checkout \
+  -H "authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"orderId":"demo-1","items":[{"productId":1,"quantity":1}],"amount":99.9}'</pre>
+<h3>10.3 Simular falha de pagamento</h3>
+<p>O arquivo <code>infra/compose/failure-mode.yml</code> aponta o pagamento para um gateway externo inalcançável, produzindo erros 502 e incrementando <code>external_gateway_failures_total</code>:</p>
+<pre>docker compose -f docker-compose.yml -f infra/compose/failure-mode.yml \
+  up -d --no-deps payment</pre>
+<p>Após alguns checkouts, o alerta <code>PaymentFailure</code> dispara, o trace de erro é retido em 100% pelo tail sampling e o log correlacionado aparece no Loki. Para voltar ao normal:</p>
+<pre>docker compose up -d --no-deps payment</pre>
+<h3>10.4 Exportar este documento para PDF</h3>
+<pre>npm run docs:pdf</pre>
+<p>O script gera <code>docs/architecture.pdf</code> a partir de <code>docs/architecture.md</code>.</p>
+<h2>11. Riscos e trade-offs</h2>
+<ul><li><strong>Tail sampling bufferiza traces em memória</strong> → manter o tráfego de demo</li></ul>
+<p>  modesto e limitar <code>decision_wait</code>/<code>num_traces</code> no Collector; documentar o   custo de memória.</p>
+<ul><li><strong>MTTR aproximado</strong> (derivado de alertas, não de incidentes) → rotulado</li></ul>
+<p>  claramente no dashboard e neste documento.</p>
+<ul><li><strong>Pagamento simulado pode mascarar a semântica real</strong> → manter a fronteira do</li></ul>
+<p>  adaptador explícita para que um cliente real possa substituí-lo.</p>
+<ul><li><strong>Contenção do SQLite sob carga</strong> → aceitável para a demo; fora do escopo de</li></ul>
+<p>  escala.</p>
+<ul><li><strong>Stack local completa consome recursos</strong> → é possível subir um perfil enxuto</li></ul>
+<p>  sem Loki/Tempo em máquinas com pouca memória.</p>
+<h2>12. Limitações</h2>
+<ul><li>Sem persistência durável de pedidos e sem hardening de produção (HA,</li></ul>
+<p>  autoscaling, gestão de segredos, TLS, nuvem).</p>
+<ul><li>Sem integração de pagamento real, sem base de usuários real e sem testes de</li></ul>
+<p>  carga.</p>
+<ul><li>Autenticação centralizada permanece apenas no gateway.</li></ul>
+<h2>13. Referências</h2>
+<ul><li><code>design.md</code> — decisões de design que originaram este documento.</li><li><code>infra/prometheus.yml</code>, <code>infra/recording-rules.yml</code>, <code>infra/alerts.yml</code> —</li></ul>
+<p>  coleta, regras de gravação e alertas.</p>
+<ul><li><code>infra/otel-collector.yaml</code> — pipeline e tail sampling.</li><li><code>infra/grafana/dashboards/*.json</code> — dashboards versionados.</li><li><code>test/integration/e2e.test.js</code> — verificação ponta a ponta de trace e logs.</li></ul>
+</body>
+</html>

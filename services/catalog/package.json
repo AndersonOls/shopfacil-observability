@@ -1,0 +1,12 @@
+{
+  "name": "@shopfacil/catalog",
+  "version": "1.0.0",
+  "private": true,
+  "main": "src/app.js",
+  "dependencies": {
+    "@shopfacil/telemetry": "*",
+    "better-sqlite3": "^11.5.0",
+    "fastify": "^4.28.1",
+    "pino": "^9.5.0"
+  }
+}

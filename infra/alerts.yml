@@ -1,0 +1,79 @@
+groups:
+  - name: shopfacil-alerts
+    rules:
+      - alert: HighCpuUsage
+        expr: 100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+          component: host
+        annotations:
+          summary: 'CPU above 80% on {{ $labels.instance }}'
+          description: 'CPU usage has been above 80% for 5 minutes (current: {{ printf "%.1f" $value }}%).'
+          action: 'Inspect load and slow loops; correlate with slow services in the Visão Geral dashboard.'
+
+      - alert: HighMemoryUsage
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 90
+        for: 5m
+        labels:
+          severity: warning
+          component: host
+        annotations:
+          summary: 'Memory above 90% on {{ $labels.instance }}'
+          description: 'Memory usage has been above 90% for 5 minutes (current: {{ printf "%.1f" $value }}%).'
+          action: 'Inspect for leaks and consider restarting the heaviest container.'
+
+      - alert: HighLatency
+        expr: histogram_quantile(0.95, sum by (le, service) (rate(http_server_request_duration_seconds_bucket[5m]))) > 0.5
+        for: 5m
+        labels:
+          severity: warning
+          component: service
+        annotations:
+          summary: 'p95 latency above 500ms for {{ $labels.service }}'
+          description: 'The 95th percentile latency for {{ $labels.service }} exceeded 500ms for 5 minutes (current: {{ humanize $value }}s).'
+          action: 'Use traces to find the slow span and the Checkout dashboard to localize the step.'
+
+      - alert: ServiceDown
+        expr: up{job="services"} == 0 or on(instance) probe_success == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: service
+        annotations:
+          summary: 'Service unavailable: {{ $labels.instance }}'
+          description: '{{ $labels.instance }} has been unreachable for 1 minute.'
+          action: 'Restart the container and inspect its logs for startup errors.'
+
+      - alert: HighErrorRate
+        expr: sum by (service) (rate(http_server_requests_total{status_class="5xx"}[5m])) / clamp_min(sum by (service) (rate(http_server_requests_total[5m])), 0.001) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          component: service
+        annotations:
+          summary: '5xx error rate above 5% for {{ $labels.service }}'
+          description: 'More than 5% of requests to {{ $labels.service }} are failing with 5xx (current: {{ humanizePercentage $value }}).'
+          action: 'Inspect error logs and error traces retained by tail sampling.'
+
+      - alert: HighDiskUsage
+        expr: (1 - (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay|squashfs"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay|squashfs"})) * 100 > 85
+        for: 10m
+        labels:
+          severity: warning
+          component: host
+        annotations:
+          summary: 'Disk above 85% on {{ $labels.instance }} ({{ $labels.mountpoint }})'
+          description: 'Disk usage on {{ $labels.mountpoint }} has been above 85% for 10 minutes.'
+          action: 'Clean up volumes and old data; verify retention settings.'
+
+      - alert: PaymentFailure
+        expr: increase(external_gateway_failures_total[5m]) > 3
+        for: 1m
+        labels:
+          severity: critical
+          component: payment
+        annotations:
+          summary: 'External payment gateway is failing'
+          description: 'More than 3 external gateway failures in the last 5 minutes.'
+          action: 'Check the simulated external gateway health and the PaymentFailure traces.'

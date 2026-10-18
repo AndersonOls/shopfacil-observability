@@ -1,0 +1,10 @@
+node_modules/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+.env
+coverage/
+dist/
+docs/*.pdf
+nohup.out

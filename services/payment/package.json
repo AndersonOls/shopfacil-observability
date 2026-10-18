@@ -1,0 +1,11 @@
+{
+  "name": "@shopfacil/payment",
+  "version": "1.0.0",
+  "private": true,
+  "main": "src/app.js",
+  "dependencies": {
+    "@shopfacil/telemetry": "*",
+    "fastify": "^4.28.1",
+    "pino": "^9.5.0"
+  }
+}
